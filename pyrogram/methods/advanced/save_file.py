@@ -7,14 +7,8 @@
 #  it under the terms of the GNU Lesser General Public License as published
 #  by the Free Software Foundation, either version 3 of the License, or
 #  (at your option) any later version.
-#
-#  Pyrogram is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU Lesser General Public License for more details.
-#
-#  You should have received a copy of the GNU Lesser General Public License
-#  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
+#  
+#  Modified and optimized with TDLib concepts for higher concurrency.
 
 import asyncio
 import functools
@@ -31,6 +25,7 @@ import pyrogram
 from pyrogram import StopTransmission
 from pyrogram import raw
 from pyrogram.session import Session
+from pyrogram.errors import RPCError, FloodWait
 
 log = logging.getLogger(__name__)
 
@@ -44,56 +39,6 @@ class SaveFile:
         progress: Callable = None,
         progress_args: tuple = ()
     ):
-        """Upload a file onto Telegram servers, without actually sending the message to anyone.
-        Useful whenever an InputFile type is required.
-
-        .. note::
-
-            This is a utility method intended to be used **only** when working with raw
-            :obj:`functions <pyrogram.api.functions>` (i.e: a Telegram API method you wish to use which is not
-            available yet in the Client class as an easy-to-use method).
-
-        .. include:: /_includes/usable-by/users-bots.rst
-
-        Parameters:
-            path (``str`` | ``BinaryIO``):
-                The path of the file you want to upload that exists on your local machine or a binary file-like object
-                with its attribute ".name" set for in-memory uploads.
-
-            file_id (``int``, *optional*):
-                In case a file part expired, pass the file_id and the file_part to retry uploading that specific chunk.
-
-            file_part (``int``, *optional*):
-                In case a file part expired, pass the file_id and the file_part to retry uploading that specific chunk.
-
-            progress (``Callable``, *optional*):
-                Pass a callback function to view the file transmission progress.
-                The function must take *(current, total)* as positional arguments (look at Other Parameters below for a
-                detailed description) and will be called back each time a new file chunk has been successfully
-                transmitted.
-
-            progress_args (``tuple``, *optional*):
-                Extra custom arguments for the progress callback function.
-                You can pass anything you need to be available in the progress callback scope; for example, a Message
-                object or a Client instance in order to edit the message with the updated progress status.
-
-        Other Parameters:
-            current (``int``):
-                The amount of bytes transmitted so far.
-
-            total (``int``):
-                The total size of the file.
-
-            *args (``tuple``, *optional*):
-                Extra custom arguments as defined in the ``progress_args`` parameter.
-                You can either keep ``*args`` or add every single extra argument in your function signature.
-
-        Returns:
-            ``InputFile``: On success, the uploaded file is returned in form of an InputFile object.
-
-        Raises:
-            RPCError: In case of a Telegram RPC error.
-        """
         async with self.save_file_semaphore:
             if path is None:
                 return None
@@ -103,12 +48,25 @@ class SaveFile:
                     data = await queue.get()
 
                     if data is None:
+                        queue.task_done()
                         return
 
-                    try:
-                        await session.invoke(data)
-                    except Exception as e:
-                        log.exception(e)
+                    rpc, current_part = data
+                    retries = 3
+
+                    while retries > 0:
+                        try:
+                            await session.invoke(rpc)
+                            break
+                        except FloodWait as e:
+                            log.warning(f"FloodWait on part {current_part}, sleeping for {e.value}s")
+                            await asyncio.sleep(e.value)
+                        except Exception as e:
+                            retries -= 1
+                            if retries == 0:
+                                log.exception(f"Failed to upload part {current_part} after retries: {e}")
+                    
+                    queue.task_done()
 
             part_size = 512 * 1024
 
@@ -138,7 +96,9 @@ class SaveFile:
 
             file_total_parts = int(math.ceil(file_size / part_size))
             is_big = file_size > 10 * 1024 * 1024
-            workers_count = 4 if is_big else 1
+            
+            # Optimized concurrency settings
+            workers_count = 10 if is_big else 4
             is_missing_part = file_id is not None
             file_id = file_id or self.rnd_id()
             md5_sum = md5() if not is_big and not is_missing_part else None
@@ -147,13 +107,16 @@ class SaveFile:
             session = await self.get_session(dc_id, is_media=True)
 
             workers = [self.loop.create_task(worker(session)) for _ in range(workers_count)]
-            queue = asyncio.Queue(1)
+            
+            # Increased queue size to pre-buffer parts like TDLib
+            queue = asyncio.Queue(workers_count * 2)
 
             try:
                 fp.seek(part_size * file_part)
 
                 while True:
-                    chunk = fp.read(part_size)
+                    # Non-blocking file reading
+                    chunk = await self.loop.run_in_executor(None, fp.read, part_size)
 
                     if not chunk:
                         if not is_big and not is_missing_part:
@@ -174,7 +137,7 @@ class SaveFile:
                             bytes=chunk
                         )
 
-                    await queue.put(rpc)
+                    await queue.put((rpc, file_part))
 
                     if is_missing_part:
                         return
@@ -201,12 +164,14 @@ class SaveFile:
             except Exception as e:
                 log.exception(e)
             else:
+                # Wait for the queue to completely finish processing before returning
+                await queue.join()
+                
                 if is_big:
                     return raw.types.InputFileBig(
                         id=file_id,
                         parts=file_total_parts,
                         name=file_name,
-
                     )
                 else:
                     return raw.types.InputFile(
